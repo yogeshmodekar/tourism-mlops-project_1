@@ -14,7 +14,6 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 
 DATA_PATH = (
     PROJECT_ROOT
-    / "tourism_project"
     / "data"
     / "tourism.csv"
 )
