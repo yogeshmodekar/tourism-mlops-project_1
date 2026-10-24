@@ -12,6 +12,9 @@ permissions:
 
 jobs:
 
+  # ---------------------------------------------
+  # 1. Validate the dataset
+  # ---------------------------------------------
   register-dataset:
     runs-on: ubuntu-latest
 
@@ -33,6 +36,9 @@ jobs:
         run: python model_building/data_register.py
 
 
+  # ---------------------------------------------
+  # 2. Prepare the data
+  # ---------------------------------------------
   data-prep:
     needs: register-dataset
     runs-on: ubuntu-latest
@@ -54,13 +60,38 @@ jobs:
       - name: Prepare Data
         run: python model_building/prep.py
 
+      - name: Verify prepared feature columns
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          for filename in ["Xtrain.csv", "Xtest.csv"]:
+              path = Path("artifacts") / filename
+              df = pd.read_csv(path)
+              print(f"{filename}: {df.columns.tolist()}")
+
+              bad = [
+                  col for col in df.columns
+                  if col.strip().lower().startswith("unnamed:")
+              ]
+              if bad:
+                  raise ValueError(
+                      f"Unexpected index columns in {filename}: {bad}"
+                  )
+          PY
+
       - name: Upload Prepared Data
         uses: actions/upload-artifact@v4
         with:
           name: prepared-data
-          path: artifacts
+          path: artifacts/
+          if-no-files-found: error
 
 
+  # ---------------------------------------------
+  # 3. Train the model
+  # ---------------------------------------------
   model-training:
     needs: data-prep
     runs-on: ubuntu-latest
@@ -83,23 +114,76 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: prepared-data
-          path: artifacts
+          path: artifacts/
 
       - name: Train Model
         env:
           MLFLOW_TRACKING_URI: file:./mlruns
         run: python model_building/train.py
 
+      - name: Verify trained model
+        run: |
+          python - <<'PY'
+          import joblib
+          from pathlib import Path
+
+          model_path = Path(
+              "tourism_project/deployment/tourism_model.joblib"
+          )
+
+          if not model_path.exists():
+              raise FileNotFoundError(
+                  f"Trained model not found: {model_path}"
+              )
+
+          model = joblib.load(model_path)
+          features = list(model.feature_names_in_)
+
+          print("Model path:", model_path)
+          print("Model features:", features)
+
+          bad = [
+              col for col in features
+              if str(col).strip().lower().startswith("unnamed:")
+          ]
+          if bad:
+              raise ValueError(
+                  f"Model contains unwanted features: {bad}"
+              )
+
+          print("Model verification passed.")
+          PY
+
       - name: Upload MLflow Logs
         uses: actions/upload-artifact@v4
         with:
           name: mlflow-runs
-          path: mlruns
+          path: mlruns/
+          if-no-files-found: warn
 
       - name: Upload Trained Model
         uses: actions/upload-artifact@v4
         with:
           name: trained-model
           path: |
-            deployment/tourism_model.joblib
-            deployment/model_metadata.json
+            tourism_project/deployment/tourism_model.joblib
+            tourism_project/deployment/model_metadata.json
+          if-no-files-found: error
+
+      # ---------------------------------------------
+      # 4. Publish the model to GitHub
+      # ---------------------------------------------
+      - name: Commit updated model to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add tourism_project/deployment/tourism_model.joblib
+          git add tourism_project/deployment/model_metadata.json
+
+          if git diff --cached --quiet; then
+            echo "No model changes to commit."
+          else
+            git commit -m "Update trained tourism prediction model"
+            git push origin HEAD:main
+          fi
