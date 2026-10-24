@@ -156,35 +156,47 @@ if submitted:
 
     row = pd.DataFrame([input_data])
 
-    # Match the model's original input column order.
+    # Match the model's expected input columns and order.
     expected_columns = getattr(model, "feature_names_in_", None)
 
     if expected_columns is not None:
         expected_columns = list(expected_columns)
 
-        missing_columns = [
-            col for col in expected_columns if col not in row.columns
+        # Detect accidental index columns in the saved model.
+        unwanted_columns = [
+            str(col) for col in expected_columns
+            if str(col).strip().lower().startswith("unnamed:")
         ]
-        extra_columns = [
-            col for col in row.columns if col not in expected_columns
-        ]
-        if "Unnamed: 0" in expected_columns:
-       row["Unnamed: 0"] = 0
 
-      missing_columns = [
-    col for col in expected_columns
-    if col not in row.columns
-]
+        if unwanted_columns:
+            st.error(
+                f"The saved model contains unwanted columns: "
+                f"{unwanted_columns}"
+            )
+            st.info(
+                "Update prep.py to remove accidental index columns, "
+                "retrain the model, and deploy the newly trained model."
+            )
+            st.stop()
+
+        missing_columns = [
+            col for col in expected_columns
+            if col not in row.columns
+        ]
+
+        extra_columns = [
+            col for col in row.columns
+            if col not in expected_columns
+        ]
 
         if missing_columns:
             st.error(
-                "The app does not collect all features required by "
-                "the trained model."
+                "The app does not collect all features required "
+                "by the trained model."
             )
             st.write("Missing model features:", missing_columns)
             st.info(
-                "Add the missing fields to the form, or retrain the "
-                "model using the intended input features."
+                "Check the model's training features and the input form."
             )
             st.stop()
 
