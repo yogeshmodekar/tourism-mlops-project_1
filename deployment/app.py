@@ -168,6 +168,13 @@ if submitted:
         extra_columns = [
             col for col in row.columns if col not in expected_columns
         ]
+        if "Unnamed: 0" in expected_columns:
+       row["Unnamed: 0"] = 0
+
+      missing_columns = [
+    col for col in expected_columns
+    if col not in row.columns
+]
 
         if missing_columns:
             st.error(
