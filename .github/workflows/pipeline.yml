@@ -1,4 +1,3 @@
-
 name: Tourism MLOps Pipeline
 
 on:
@@ -11,7 +10,6 @@ permissions:
   contents: write
 
 jobs:
-
   # ---------------------------------------------
   # 1. Validate the dataset
   # ---------------------------------------------
@@ -34,7 +32,6 @@ jobs:
 
       - name: Validate Dataset
         run: python model_building/data_register.py
-
 
   # ---------------------------------------------
   # 2. Prepare the data
@@ -68,17 +65,26 @@ jobs:
 
           for filename in ["Xtrain.csv", "Xtest.csv"]:
               path = Path("artifacts") / filename
+
+              if not path.exists():
+                  raise FileNotFoundError(
+                      f"Prepared data file not found: {path}"
+                  )
+
               df = pd.read_csv(path)
               print(f"{filename}: {df.columns.tolist()}")
 
               bad = [
-                  col for col in df.columns
-                  if col.strip().lower().startswith("unnamed:")
+                  str(col) for col in df.columns
+                  if str(col).strip().lower().startswith("unnamed:")
               ]
+
               if bad:
                   raise ValueError(
                       f"Unexpected index columns in {filename}: {bad}"
                   )
+
+          print("Prepared data verification passed.")
           PY
 
       - name: Upload Prepared Data
@@ -88,9 +94,8 @@ jobs:
           path: artifacts/
           if-no-files-found: error
 
-
   # ---------------------------------------------
-  # 3. Train the model
+  # 3. Train and verify the model
   # ---------------------------------------------
   model-training:
     needs: data-prep
@@ -127,25 +132,31 @@ jobs:
           import joblib
           from pathlib import Path
 
-          model_path = Path(
-              "tourism_project/deployment/tourism_model.joblib"
-          )
+          model_path = Path("deployment/tourism_model.joblib")
 
           if not model_path.exists():
               raise FileNotFoundError(
-                  f"Trained model not found: {model_path}"
+                  f"Trained model not found: {model_path}. "
+                  "Check MODEL_DIR in train.py."
               )
 
           model = joblib.load(model_path)
-          features = list(model.feature_names_in_)
 
+          if not hasattr(model, "feature_names_in_"):
+              raise ValueError(
+                  "Model does not expose feature_names_in_. "
+                  "Check the training pipeline."
+              )
+
+          features = list(model.feature_names_in_)
           print("Model path:", model_path)
           print("Model features:", features)
 
           bad = [
-              col for col in features
+              str(col) for col in features
               if str(col).strip().lower().startswith("unnamed:")
           ]
+
           if bad:
               raise ValueError(
                   f"Model contains unwanted features: {bad}"
@@ -166,8 +177,8 @@ jobs:
         with:
           name: trained-model
           path: |
-            tourism_project/deployment/tourism_model.joblib
-            tourism_project/deployment/model_metadata.json
+            deployment/tourism_model.joblib
+            deployment/model_metadata.json
           if-no-files-found: error
 
       # ---------------------------------------------
@@ -178,8 +189,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add tourism_project/deployment/tourism_model.joblib
-          git add tourism_project/deployment/model_metadata.json
+          git add deployment/tourism_model.joblib
+          git add deployment/model_metadata.json
 
           if git diff --cached --quiet; then
             echo "No model changes to commit."
