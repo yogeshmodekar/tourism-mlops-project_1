@@ -31,7 +31,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
 ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
-MODEL_DIR = PROJECT_ROOT / "tourism_project" / "deployment"
+MODEL_DIR = PROJECT_ROOT / "deployment"
 
 TARGET = "ProdTaken"
 
