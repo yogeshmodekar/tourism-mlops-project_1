@@ -1,7 +1,6 @@
 
-import json
-import os
 from pathlib import Path
+import json
 
 import joblib
 import mlflow
@@ -9,24 +8,24 @@ import mlflow.sklearn
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
-    roc_auc_score,
-    classification_report,
 )
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.base import clone
 
 
 # --------------------------------------------------
-# 1. Define paths
+# PATHS AND CONFIGURATION
 # --------------------------------------------------
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
@@ -34,8 +33,8 @@ ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
 MODEL_DIR = PROJECT_ROOT / "deployment"
 
 TARGET = "ProdTaken"
+RANDOM_STATE = 42
 
-# Explicitly identify categorical columns in this dataset.
 CATEGORICAL_COLUMNS = [
     "TypeofContact",
     "Occupation",
@@ -46,265 +45,368 @@ CATEGORICAL_COLUMNS = [
 ]
 
 
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
 def remove_unnamed_columns(df):
-    """Remove accidental CSV index columns such as Unnamed: 0."""
-    df.columns = df.columns.astype(str).str.strip()
+    df = df.copy()
+
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
 
     unwanted = [
-        col for col in df.columns
-        if col.strip().lower().startswith("unnamed:")
+        column
+        for column in df.columns
+        if column.lower().startswith("unnamed:")
     ]
 
     if unwanted:
-        print(f"Removing accidental columns: {unwanted}")
+        print("Removing accidental columns:", unwanted)
         df = df.drop(columns=unwanted)
 
     return df
 
 
-def main():
-    # --------------------------------------------------
-    # 2. Find the prepared data files
-    # --------------------------------------------------
-    filenames = [
-        "Xtrain.csv",
-        "Xtest.csv",
-        "ytrain.csv",
-        "ytest.csv",
-    ]
+def read_csv_artifact(filename):
+    path = ARTIFACT_DIR / filename
 
-    if all((ARTIFACT_DIR / name).exists() for name in filenames):
-        data_dir = ARTIFACT_DIR
-    elif all((PROJECT_ROOT / name).exists() for name in filenames):
-        data_dir = PROJECT_ROOT
-    else:
-        missing = [
-            name for name in filenames
-            if not (ARTIFACT_DIR / name).exists()
-            and not (PROJECT_ROOT / name).exists()
-        ]
+    if not path.exists():
         raise FileNotFoundError(
-            f"Missing prepared data files: {missing}. Run prep.py first."
+            f"Required training artifact not found: {path}. "
+            "Run model_building/prep.py first."
         )
 
-    # --------------------------------------------------
-    # 3. Load training and testing data
-    # --------------------------------------------------
-    X_train = pd.read_csv(data_dir / "Xtrain.csv")
-    X_test = pd.read_csv(data_dir / "Xtest.csv")
+    return pd.read_csv(path)
 
-    y_train_df = pd.read_csv(data_dir / "ytrain.csv")
-    y_test_df = pd.read_csv(data_dir / "ytest.csv")
 
-    if TARGET not in y_train_df.columns or TARGET not in y_test_df.columns:
-        raise ValueError(f"Target column '{TARGET}' is missing from target files.")
+def load_target(filename):
+    df = read_csv_artifact(filename)
 
-    y_train = pd.to_numeric(y_train_df[TARGET], errors="raise").astype(int)
-    y_test = pd.to_numeric(y_test_df[TARGET], errors="raise").astype(int)
+    if TARGET in df.columns:
+        if df.shape[1] != 1:
+            raise ValueError(
+                f"{filename} must contain only the target column."
+            )
+        return df[TARGET]
 
-    # --------------------------------------------------
-    # 4. Remove accidental index columns
-    # --------------------------------------------------
+    if df.shape[1] == 1:
+        return df.iloc[:, 0]
+
+    raise ValueError(
+        f"Cannot identify target column in {filename}."
+    )
+
+
+# --------------------------------------------------
+# LOAD DATA
+# --------------------------------------------------
+
+def main():
+
+    MODEL_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print("Project root:", PROJECT_ROOT)
+    print("Artifact directory:", ARTIFACT_DIR)
+    print("Model directory:", MODEL_DIR)
+
+    X_train = read_csv_artifact("Xtrain.csv")
+    X_test = read_csv_artifact("Xtest.csv")
+
+    y_train = load_target("ytrain.csv")
+    y_test = load_target("ytest.csv")
+
+    # Remove unwanted columns before fitting
     X_train = remove_unnamed_columns(X_train)
     X_test = remove_unnamed_columns(X_test)
 
-    if X_train.empty or X_train.shape[1] == 0:
-        raise ValueError("No training features remain after cleaning.")
+    # Validate feature columns
+    bad_columns = [
+        column
+        for column in X_train.columns
+        if str(column).strip().lower().startswith("unnamed:")
+    ]
+
+    if bad_columns:
+        raise ValueError(
+            f"Unexpected index columns remain in training data: "
+            f"{bad_columns}"
+        )
 
     if list(X_train.columns) != list(X_test.columns):
         raise ValueError(
-            "Training and testing features do not match.\n"
-            f"Training: {X_train.columns.tolist()}\n"
-            f"Testing: {X_test.columns.tolist()}"
+            "Training and testing feature columns do not match.\n"
+            f"Training: {list(X_train.columns)}\n"
+            f"Testing: {list(X_test.columns)}"
         )
 
-    if len(X_train) != len(y_train) or len(X_test) != len(y_test):
-        raise ValueError("Feature rows and target rows do not match.")
+    if len(X_train) != len(y_train):
+        raise ValueError(
+            "Training feature and target row counts do not match."
+        )
 
-    # --------------------------------------------------
-    # 5. Set categorical and numeric features
-    # --------------------------------------------------
+    if len(X_test) != len(y_test):
+        raise ValueError(
+            "Testing feature and target row counts do not match."
+        )
+
+    if X_train.empty or X_test.empty:
+        raise ValueError(
+            "Training or testing dataset is empty."
+        )
+
+    y_train = pd.to_numeric(y_train, errors="raise").astype(int)
+    y_test = pd.to_numeric(y_test, errors="raise").astype(int)
+
+    # Determine categorical and numeric columns from actual data
+    categorical_columns = [
+        column
+        for column in CATEGORICAL_COLUMNS
+        if column in X_train.columns
+    ]
+
     missing_categorical = [
-        col for col in CATEGORICAL_COLUMNS
-        if col not in X_train.columns
+        column
+        for column in CATEGORICAL_COLUMNS
+        if column not in X_train.columns
     ]
 
     if missing_categorical:
-        raise ValueError(
-            f"Expected categorical columns are missing: {missing_categorical}"
+        print(
+            "Configured categorical columns not present:",
+            missing_categorical
         )
 
-    categorical = CATEGORICAL_COLUMNS
-    numeric = [
-        col for col in X_train.columns
-        if col not in categorical
+    numeric_columns = [
+        column
+        for column in X_train.columns
+        if column not in categorical_columns
     ]
 
-    # Ensure numeric columns contain numeric values.
-    for col in numeric:
-        X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
-        X_test[col] = pd.to_numeric(X_test[col], errors="coerce")
+    # Normalize feature types
+    for column in numeric_columns:
+        X_train[column] = pd.to_numeric(
+            X_train[column],
+            errors="coerce"
+        )
 
-    # Ensure categorical columns are treated as text.
-    for col in categorical:
-        X_train[col] = X_train[col].astype("string").astype(object)
-        X_test[col] = X_test[col].astype("string").astype(object)
+        X_test[column] = pd.to_numeric(
+            X_test[column],
+            errors="coerce"
+        )
 
-    print("Training data directory:", data_dir)
-    print("Training features:", X_train.columns.tolist())
-    print("Numeric features:", numeric)
-    print("Categorical features:", categorical)
+    for column in categorical_columns:
+        X_train[column] = X_train[column].astype("object")
+        X_test[column] = X_test[column].astype("object")
+
+    print("Training shape:", X_train.shape)
+    print("Testing shape:", X_test.shape)
+    print("Numeric columns:", numeric_columns)
+    print("Categorical columns:", categorical_columns)
 
     # --------------------------------------------------
-    # 6. Create preprocessing pipeline
+    # PREPROCESSING PIPELINE
     # --------------------------------------------------
-    preprocessor = ColumnTransformer(
-        transformers=[
+
+    numeric_pipeline = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            )
+        ]
+    )
+
+    categorical_pipeline = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="most_frequent")
+            ),
+            (
+                "onehot",
+                OneHotEncoder(handle_unknown="ignore")
+            ),
+        ]
+    )
+
+    transformers = []
+
+    if numeric_columns:
+        transformers.append(
             (
                 "numeric",
-                Pipeline([
-                    ("imputer", SimpleImputer(strategy="median"))
-                ]),
-                numeric,
-            ),
+                numeric_pipeline,
+                numeric_columns
+            )
+        )
+
+    if categorical_columns:
+        transformers.append(
             (
                 "categorical",
-                Pipeline([
-                    ("imputer", SimpleImputer(strategy="most_frequent")),
-                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
-                ]),
-                categorical,
+                categorical_pipeline,
+                categorical_columns
+            )
+        )
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop"
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            (
+                "classifier",
+                RandomForestClassifier(
+                    random_state=RANDOM_STATE,
+                    class_weight="balanced",
+                    n_jobs=-1
+                )
             ),
-        ],
-        remainder="drop",
+        ]
     )
 
     # --------------------------------------------------
-    # 7. Create model pipeline
+    # GRID SEARCH
     # --------------------------------------------------
-    model = Pipeline([
-        ("preprocess", preprocessor),
-        (
-            "classifier",
-            RandomForestClassifier(
-                random_state=42,
-                class_weight="balanced",
-                n_jobs=-1,
-            ),
-        ),
-    ])
 
     param_grid = {
-        "classifier__n_estimators": [150, 300],
+        "classifier__n_estimators": [100, 200],
         "classifier__max_depth": [None, 10, 20],
-        "classifier__min_samples_leaf": [1, 2],
+        "classifier__min_samples_split": [2, 5],
     }
-
-    cv = StratifiedKFold(
-        n_splits=5,
-        shuffle=True,
-        random_state=42,
-    )
 
     search = GridSearchCV(
-        model,
-        param_grid,
+        estimator=pipeline,
+        param_grid=param_grid,
         scoring="f1",
-        cv=cv,
+        cv=3,
         n_jobs=-1,
         refit=True,
-        verbose=1,
+        verbose=1
     )
 
     # --------------------------------------------------
-    # 8. Train and evaluate model
+    # TRAIN AND EVALUATE
     # --------------------------------------------------
-    tracking_uri = os.environ.get(
-        "MLFLOW_TRACKING_URI",
-        "file:./mlruns",
-    )
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment("tourism-purchase-prediction")
 
-    with mlflow.start_run(run_name="random-forest-grid-search"):
+    mlflow.set_experiment("Tourism_Prediction")
+
+    with mlflow.start_run():
+
         search.fit(X_train, y_train)
 
-        best = search.best_estimator_
-        predictions = best.predict(X_test)
-        probabilities = best.predict_proba(X_test)[:, 1]
+        best_model = search.best_estimator_
 
-        metrics = {
-            "accuracy": float(accuracy_score(y_test, predictions)),
-            "precision": float(
-                precision_score(y_test, predictions, zero_division=0)
-            ),
-            "recall": float(
-                recall_score(y_test, predictions, zero_division=0)
-            ),
-            "f1": float(
-                f1_score(y_test, predictions, zero_division=0)
-            ),
-        }
+        predictions = best_model.predict(X_test)
 
-        if y_test.nunique() == 2:
-            metrics["roc_auc"] = float(
-                roc_auc_score(y_test, probabilities)
-            )
-
-        mlflow.log_params({
-            key: str(value)
-            for key, value in search.best_params_.items()
-        })
-        mlflow.log_metric("best_cv_f1", float(search.best_score_))
-        mlflow.log_metrics(metrics)
-        mlflow.log_param("model", "RandomForestClassifier")
-        mlflow.log_param("training_rows", len(X_train))
-        mlflow.log_param("test_rows", len(X_test))
-        mlflow.log_param("feature_count", len(X_train.columns))
-
-        print("\nBest parameters:")
-        print(search.best_params_)
-
-        print("\nTest metrics:")
-        print(json.dumps(metrics, indent=2))
-
-        print("\nClassification report:")
-        print(classification_report(
+        accuracy = accuracy_score(y_test, predictions)
+        precision = precision_score(
             y_test,
             predictions,
-            zero_division=0,
-        ))
+            zero_division=0
+        )
+        recall = recall_score(
+            y_test,
+            predictions,
+            zero_division=0
+        )
+        f1 = f1_score(
+            y_test,
+            predictions,
+            zero_division=0
+        )
 
-        mlflow.sklearn.log_model(best, artifact_path="model")
+        print("\nBest parameters:", search.best_params_)
+        print("Accuracy:", accuracy)
+        print("Precision:", precision)
+        print("Recall:", recall)
+        print("F1 score:", f1)
 
-    # --------------------------------------------------
-    # 9. Save trained model and metadata
-    # --------------------------------------------------
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        mlflow.log_params(search.best_params_)
+        mlflow.log_metric("accuracy", accuracy)
+        mlflow.log_metric("precision", precision)
+        mlflow.log_metric("recall", recall)
+        mlflow.log_metric("f1_score", f1)
 
-    job_path = MODEL_DIR / "tourism_model.joblib"
-    joblib.dump(best, job_path)
+        mlflow.sklearn.log_model(
+            best_model,
+            artifact_path="tourism_model"
+        )
 
-    metadata = {
-        "target": TARGET,
-        "features": X_train.columns.tolist(),
-        "best_params": {
-            key: str(value)
-            for key, value in search.best_params_.items()
-        },
-        "test_metrics": metrics,
-    }
+        # --------------------------------------------------
+        # SAVE MODEL
+        # --------------------------------------------------
 
-    metadata_path = MODEL_DIR / "model_metadata.json"
-    metadata_path.write_text(
-        json.dumps(metadata, indent=2),
-        encoding="utf-8",
-    )
+        model_path = MODEL_DIR / "tourism_model.joblib"
 
-    print("\nModel training completed successfully.")
-    print(f"Saved model to: {job_path}")
-    print(f"Saved metadata to: {metadata_path}")
-    print("Saved model features:", best.feature_names_in_.tolist())
+        joblib.dump(
+            best_model,
+            model_path
+        )
+
+        # Reload saved model to verify actual file
+        saved_model = joblib.load(model_path)
+
+        saved_features = list(
+            saved_model.feature_names_in_
+        )
+
+        bad_features = [
+            column
+            for column in saved_features
+            if str(column).strip().lower().startswith("unnamed:")
+        ]
+
+        if bad_features:
+            raise ValueError(
+                f"Saved model contains unwanted columns: "
+                f"{bad_features}"
+            )
+
+        print("\nSaved model:", model_path.resolve())
+        print("Saved model input features:", saved_features)
+        print("Saved model verification passed.")
+
+        # Save metadata
+        metadata = {
+            "target": TARGET,
+            "model_type": "RandomForestClassifier",
+            "feature_columns": saved_features,
+            "numeric_columns": numeric_columns,
+            "categorical_columns": categorical_columns,
+            "best_parameters": search.best_params_,
+            "metrics": {
+                "accuracy": float(accuracy),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1_score": float(f1),
+            },
+        }
+
+        metadata_path = MODEL_DIR / "model_metadata.json"
+
+        with open(
+            metadata_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                metadata,
+                file,
+                indent=4,
+                default=str
+            )
+
+        print("Metadata saved:", metadata_path.resolve())
 
 
 if __name__ == "__main__":
