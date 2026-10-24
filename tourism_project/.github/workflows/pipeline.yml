@@ -98,3 +98,4 @@ jobs:
             git commit -m "Update trained tourism model [skip ci]"
             git push origin HEAD:main
           fi
+
